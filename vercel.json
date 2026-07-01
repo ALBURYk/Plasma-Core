@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "bash scripts/vercel_build.sh",
+  "outputDirectory": "build/web",
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "functions": {
+    "api/**/*.py": {
+      "runtime": "python3.11",
+      "excludeFiles": "{android/**,ios/**,linux/**,macos/**,windows/**,build/**,.dart_tool/**,test/**}"
+    }
+  }
+}
