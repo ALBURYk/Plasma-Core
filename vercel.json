@@ -14,7 +14,6 @@
   ],
   "functions": {
     "api/**/*.py": {
-      "runtime": "python3.11",
       "excludeFiles": "{android/**,ios/**,linux/**,macos/**,windows/**,build/**,.dart_tool/**,test/**}"
     }
   }
