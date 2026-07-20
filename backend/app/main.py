@@ -38,11 +38,15 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/optimize", response_model=OptimizeResponse)
-async def optimize(
-    file: UploadFile = File(..., description="Input protein structure in .pdb format."),
-    temperature: float = Form(..., ge=20, le=60),
-    ph: float = Form(..., ge=0, le=14),
+@app.get("/api/health")
+def api_health() -> dict[str, str]:
+    return health()
+
+
+async def _optimize_impl(
+    file: UploadFile,
+    temperature: float,
+    ph: float,
 ) -> OptimizeResponse:
     if not file.filename.lower().endswith(".pdb"):
         raise HTTPException(status_code=400, detail="Only .pdb files are supported.")
@@ -59,3 +63,21 @@ async def optimize(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return OptimizeResponse(**result)
+
+
+@app.post("/v1/optimize", response_model=OptimizeResponse)
+async def optimize_v1(
+    file: UploadFile = File(..., description="Input protein structure in .pdb format."),
+    temperature: float = Form(..., ge=20, le=60),
+    ph: float = Form(..., ge=0, le=14),
+) -> OptimizeResponse:
+    return await _optimize_impl(file=file, temperature=temperature, ph=ph)
+
+
+@app.post("/api/v1/optimize", response_model=OptimizeResponse)
+async def optimize_api_v1(
+    file: UploadFile = File(..., description="Input protein structure in .pdb format."),
+    temperature: float = Form(..., ge=20, le=60),
+    ph: float = Form(..., ge=0, le=14),
+) -> OptimizeResponse:
+    return await _optimize_impl(file=file, temperature=temperature, ph=ph)
