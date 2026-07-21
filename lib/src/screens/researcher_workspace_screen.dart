@@ -1,18 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:html' as html;
-import 'dart:js_util' as js_util;
-import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/material.dart';
-import 'package:js/js.dart';
 
-@JS('plasmaCoreRenderMolecule')
-external void _renderMoleculeJs(
-  String elementId,
-  String pdbText,
-  Object mutationResidues,
-);
+import 'researcher_workspace_platform.dart';
 
 const _ink = Color(0xFF111827);
 const _muted = Color(0xFF64748B);
@@ -48,7 +39,6 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
   bool _english = false;
   bool _darkMode = false;
   String _status = 'Готово к загрузке структуры';
-  html.HttpRequest? _activeRequest;
 
   @override
   void initState() {
@@ -59,32 +49,17 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
 
   void _registerViewer() {
     if (_viewerRegistered) return;
-    ui_web.platformViewRegistry.registerViewFactory(_viewerId, (int viewId) {
-      return html.DivElement()
-        ..id = _viewerId
-        ..style.width = '100%'
-        ..style.height = '100%'
-        ..style.border = '0'
-        ..style.overflow = 'hidden'
-        ..style.backgroundColor = '#07111f';
-    });
+    registerViewer(_viewerId);
     _viewerRegistered = true;
   }
 
   Future<void> _pickPdbFile() async {
-    final input = html.FileUploadInputElement()..accept = '.pdb';
-    input.click();
-    await input.onChange.first;
-    final file = input.files?.first;
-    if (file == null) return;
-
-    final reader = html.FileReader();
-    reader.readAsText(file);
-    await reader.onLoad.first;
+    final result = await pickPdbFile();
+    if (result == null) return;
 
     setState(() {
-      _fileName = file.name;
-      _pdbText = reader.result?.toString() ?? '';
+      _fileName = result.fileName;
+      _pdbText = result.pdbText;
       _optimizedPdb = _pdbText;
       _clearResult();
       _status = 'Файл загружен';
@@ -99,10 +74,9 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
     });
 
     try {
-      final pdb = await html.HttpRequest.getString(
+      final pdb = await loadPdbFromRcsb(
         'https://files.rcsb.org/download/5XJH.pdb',
-      ).timeout(const Duration(seconds: 12));
-
+      );
       setState(() {
         _fileName = '5XJH.pdb';
         _pdbText = pdb;
@@ -163,7 +137,6 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
         _status = 'Backend недоступен. Показан локальный расчет';
       });
     } finally {
-      _activeRequest = null;
       setState(() => _isRunning = false);
       if (!_cancelRequested) _renderMolecule();
     }
@@ -171,7 +144,6 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
 
   void _stopOptimization() {
     _cancelRequested = true;
-    _activeRequest?.abort();
     setState(() {
       _isRunning = false;
       _clearResult();
@@ -204,40 +176,32 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
       return ['$baseUrl/api/v1/optimize'];
     }
 
-    final host = html.window.location.hostname;
-    final isLocalHost =
-        host == 'localhost' || host == '127.0.0.1' || host == '::1';
-    return [
-      if (!isLocalHost) '/api/v1/optimize',
+    final localEndpoints = [
       'http://127.0.0.1:8000/api/v1/optimize',
       'http://127.0.0.1:8001/api/v1/optimize',
       'http://127.0.0.1:8002/api/v1/optimize',
+      'http://10.0.2.2:8000/api/v1/optimize',
     ];
+
+    if (!isWeb) return localEndpoints;
+    return ['/api/v1/optimize', ...localEndpoints];
   }
 
   Future<_OptimizationResult> _postOptimization(String endpoint) async {
-    final form = html.FormData()
-      ..appendBlob(
-        'file',
-        html.Blob([_pdbText], 'chemical/x-pdb'),
-        _fileName.endsWith('.pdb') ? _fileName : 'input.pdb',
-      )
-      ..append('temperature', _temperature.toStringAsFixed(1))
-      ..append('ph', _ph.toStringAsFixed(1));
-
-    final request = html.HttpRequest();
-    _activeRequest = request;
-    request.open('POST', endpoint);
-    request.send(form);
-    await request.onLoadEnd.first.timeout(const Duration(seconds: 8));
+    final response = await postOptimization(
+      endpoint,
+      _fileName,
+      _pdbText,
+      _temperature.toStringAsFixed(1),
+      _ph.toStringAsFixed(1),
+    );
 
     if (_cancelRequested) throw StateError('cancelled');
-    final status = request.status ?? 0;
-    if (status < 200 || status > 299) {
-      throw StateError('Backend returned $status');
+    if (response.status < 200 || response.status > 299) {
+      throw StateError('Backend returned ${response.status}');
     }
 
-    final data = jsonDecode(request.responseText ?? '{}') as Map<String, dynamic>;
+    final data = jsonDecode(response.responseText) as Map<String, dynamic>;
     return _OptimizationResult(
       pdb: data['optimized_pdb'] as String? ?? _pdbText,
       fasta: data['fasta'] as String? ?? '',
@@ -250,22 +214,21 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
   void _renderMolecule() {
     scheduleMicrotask(() {
       final residues = _mutations.map((mutation) => mutation.position).toList();
-      _renderMoleculeJs(
+      renderMolecule(
         _viewerId,
         _optimizedPdb.isEmpty ? _pdbText : _optimizedPdb,
-        js_util.jsify(residues) as Object,
+        residues,
       );
     });
   }
 
   void _downloadFasta() {
     if (_fastaText.isEmpty) return;
-    final blob = html.Blob([_fastaText], 'text/plain;charset=utf-8');
-    final url = html.Url.createObjectUrlFromBlob(blob);
-    html.AnchorElement(href: url)
-      ..download = 'plasma_core_candidate.fasta'
-      ..click();
-    html.Url.revokeObjectUrl(url);
+    downloadText(
+      'plasma_core_candidate.fasta',
+      _fastaText,
+      'text/plain;charset=utf-8',
+    );
   }
 
   @override
@@ -314,39 +277,80 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
                   const SizedBox(height: 12),
                   Expanded(
                     child: compact
-                        ? Column(
+                        ? ListView(
+                            physics: const BouncingScrollPhysics(
+                              parent: AlwaysScrollableScrollPhysics(),
+                            ),
                             children: [
                               inputPanel,
                               const SizedBox(height: 12),
-                              Expanded(child: moleculePanel),
+                              SizedBox(
+                                height: (constraints.maxHeight * 0.46).clamp(
+                                  280.0,
+                                  520.0,
+                                ),
+                                child: moleculePanel,
+                              ),
+                              const SizedBox(height: 12),
+                              _ResultPanel(
+                                english: _english,
+                                fastaText: _fastaText,
+                                hasResult: _hasResult,
+                                mutations: _mutations,
+                                onDownload: _downloadFasta,
+                                compact: true,
+                              ),
+                              const SizedBox(height: 6),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: Text(
+                                  'made by Albury',
+                                  style: Theme.of(context).textTheme.labelSmall
+                                      ?.copyWith(
+                                        color: _muted,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
                             ],
                           )
                         : Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
                               SizedBox(width: 380, child: inputPanel),
                               const SizedBox(width: 12),
-                              Expanded(child: moleculePanel),
+                              Expanded(
+                                child: Column(
+                                  children: [
+                                    Expanded(child: moleculePanel),
+                                    const SizedBox(height: 12),
+                                    _ResultPanel(
+                                      english: _english,
+                                      fastaText: _fastaText,
+                                      hasResult: _hasResult,
+                                      mutations: _mutations,
+                                      onDownload: _downloadFasta,
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Align(
+                                      alignment: Alignment.centerRight,
+                                      child: Text(
+                                        'made by Albury',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .labelSmall
+                                            ?.copyWith(
+                                              color: _muted,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ],
                           ),
-                  ),
-                  const SizedBox(height: 12),
-                  _ResultPanel(
-                    english: _english,
-                    fastaText: _fastaText,
-                    hasResult: _hasResult,
-                    mutations: _mutations,
-                    onDownload: _downloadFasta,
-                  ),
-                  const SizedBox(height: 6),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: Text(
-                      'made by Albury',
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                            color: _muted,
-                            fontWeight: FontWeight.w700,
-                          ),
-                    ),
                   ),
                 ],
               );
@@ -360,10 +364,26 @@ class _ResearcherWorkspaceScreenState extends State<ResearcherWorkspaceScreen> {
 
     return ColorFiltered(
       colorFilter: const ColorFilter.matrix([
-        -0.82, 0, 0, 0, 235,
-        0, -0.82, 0, 0, 235,
-        0, 0, -0.82, 0, 235,
-        0, 0, 0, 1, 0,
+        -0.82,
+        0,
+        0,
+        0,
+        235,
+        0,
+        -0.82,
+        0,
+        0,
+        235,
+        0,
+        0,
+        -0.82,
+        0,
+        235,
+        0,
+        0,
+        0,
+        1,
+        0,
       ]),
       child: scaffold,
     );
@@ -385,38 +405,103 @@ class _WorkspaceHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 18),
-      decoration: _panelDecoration(),
-      child: Row(
-        children: [
-          Icon(Icons.biotech_outlined, color: Theme.of(context).colorScheme.primary),
-          const SizedBox(width: 10),
-          Text(
-            'Plasma Core',
-            style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                  color: _ink,
-                  fontWeight: FontWeight.w800,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final narrow = constraints.maxWidth < 840;
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          decoration: _panelDecoration(),
+          child: narrow
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Plasma Core',
+                            style: Theme.of(context).textTheme.titleLarge
+                                ?.copyWith(
+                                  color: _ink,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton(
+                          onPressed: onToggleLanguage,
+                          child: Text(english ? 'EN' : 'RU'),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          tooltip: darkMode ? 'Light mode' : 'Dark mode',
+                          onPressed: onToggleTheme,
+                          icon: Icon(
+                            darkMode
+                                ? Icons.wb_sunny_outlined
+                                : Icons.dark_mode_outlined,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _SmallPill(
+                          text: english
+                              ? 'Protein design workspace'
+                              : 'Рабочая область белка',
+                        ),
+                        const _SmallPill(text: 'PDB: RCSB 5XJH'),
+                      ],
+                    ),
+                  ],
+                )
+              : Row(
+                  children: [
+                    Icon(
+                      Icons.biotech_outlined,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      'Plasma Core',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        color: _ink,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    _SmallPill(
+                      text: english
+                          ? 'Protein design workspace'
+                          : 'Рабочая область белка',
+                    ),
+                    const Spacer(),
+                    const _SmallPill(text: 'PDB: RCSB 5XJH'),
+                    const SizedBox(width: 8),
+                    OutlinedButton(
+                      onPressed: onToggleLanguage,
+                      child: Text(english ? 'EN' : 'RU'),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      tooltip: darkMode ? 'Light mode' : 'Dark mode',
+                      onPressed: onToggleTheme,
+                      icon: Icon(
+                        darkMode
+                            ? Icons.wb_sunny_outlined
+                            : Icons.dark_mode_outlined,
+                      ),
+                    ),
+                  ],
                 ),
-          ),
-          const SizedBox(width: 14),
-          _SmallPill(text: english ? 'Protein design workspace' : 'Рабочая область белка'),
-          const Spacer(),
-          const _SmallPill(text: 'PDB: RCSB 5XJH'),
-          const SizedBox(width: 8),
-          OutlinedButton(
-            onPressed: onToggleLanguage,
-            child: Text(english ? 'EN' : 'RU'),
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            tooltip: darkMode ? 'Light mode' : 'Dark mode',
-            onPressed: onToggleTheme,
-            icon: Icon(darkMode ? Icons.wb_sunny_outlined : Icons.dark_mode_outlined),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -438,7 +523,9 @@ class _SmallPill extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         child: Text(
           text,
-          style: Theme.of(context).textTheme.labelMedium?.copyWith(color: _muted),
+          style: Theme.of(
+            context,
+          ).textTheme.labelMedium?.copyWith(color: _muted),
         ),
       ),
     );
@@ -577,14 +664,16 @@ class _PanelTitle extends StatelessWidget {
               Text(
                 title,
                 style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      color: _ink,
-                      fontWeight: FontWeight.w800,
-                    ),
+                  color: _ink,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
               const SizedBox(height: 2),
               Text(
                 subtitle,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: _muted),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: _muted),
               ),
             ],
           ),
@@ -629,30 +718,55 @@ class _FileBox extends StatelessWidget {
                     _fileNameText(fileName, english),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: _ink, fontWeight: FontWeight.w700),
+                    style: const TextStyle(
+                      color: _ink,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: onPickFile,
-                    icon: const Icon(Icons.upload_file_outlined),
-                    label: Text(english ? 'PDB file' : 'PDB файл'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: onLoadPetase,
-                    icon: const Icon(Icons.cloud_download_outlined),
-                    label: const Text('5XJH'),
-                  ),
-                ),
-              ],
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final narrow = constraints.maxWidth < 360;
+                return narrow
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: onPickFile,
+                            icon: const Icon(Icons.upload_file_outlined),
+                            label: Text(english ? 'PDB file' : 'PDB файл'),
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(
+                            onPressed: onLoadPetase,
+                            icon: const Icon(Icons.cloud_download_outlined),
+                            label: const Text('5XJH'),
+                          ),
+                        ],
+                      )
+                    : Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: onPickFile,
+                              icon: const Icon(Icons.upload_file_outlined),
+                              label: Text(english ? 'PDB file' : 'PDB файл'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: onLoadPetase,
+                              icon: const Icon(Icons.cloud_download_outlined),
+                              label: const Text('5XJH'),
+                            ),
+                          ),
+                        ],
+                      );
+              },
             ),
           ],
         ),
@@ -696,17 +810,27 @@ class _SliderBlock extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(icon, size: 19, color: Theme.of(context).colorScheme.primary),
+                Icon(
+                  icon,
+                  size: 19,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
                     label,
-                    style: const TextStyle(color: _ink, fontWeight: FontWeight.w700),
+                    style: const TextStyle(
+                      color: _ink,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
                 Text(
                   valueLabel,
-                  style: const TextStyle(color: _ink, fontWeight: FontWeight.w800),
+                  style: const TextStyle(
+                    color: _ink,
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ],
             ),
@@ -745,8 +869,8 @@ class _MoleculePanel extends StatelessWidget {
         child: Column(
           children: [
             Container(
-              height: 52,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              constraints: const BoxConstraints(minHeight: 52),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               decoration: const BoxDecoration(
                 color: _panel,
                 border: Border(bottom: BorderSide(color: _line)),
@@ -755,14 +879,26 @@ class _MoleculePanel extends StatelessWidget {
                 children: [
                   const Icon(Icons.view_in_ar_outlined, color: _ink),
                   const SizedBox(width: 10),
-                  Text(
-                    english ? '3D structure' : '3D структура',
-                    style: const TextStyle(color: _ink, fontWeight: FontWeight.w800),
+                  Expanded(
+                    child: Text(
+                      english ? '3D structure' : '3D структура',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: _ink,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
                   ),
-                  const Spacer(),
-                  Text(
-                    status,
-                    style: const TextStyle(color: _muted),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      status,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(color: _muted, fontSize: 12),
+                    ),
                   ),
                   const SizedBox(width: 12),
                   _SmallPill(
@@ -774,9 +910,7 @@ class _MoleculePanel extends StatelessWidget {
               ),
             ),
             Expanded(
-              child: HtmlElementView(
-                viewType: _ResearcherWorkspaceScreenState._viewerId,
-              ),
+              child: buildViewer(_ResearcherWorkspaceScreenState._viewerId),
             ),
           ],
         ),
@@ -792,6 +926,7 @@ class _ResultPanel extends StatelessWidget {
     required this.hasResult,
     required this.mutations,
     required this.onDownload,
+    this.compact = false,
   });
 
   final bool english;
@@ -799,18 +934,27 @@ class _ResultPanel extends StatelessWidget {
   final bool hasResult;
   final List<_MutationInfo> mutations;
   final VoidCallback onDownload;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 220,
-      child: Row(
-        children: [
-          Expanded(
-            child: DecoratedBox(
+      height: compact ? 430 : 220,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final narrow = constraints.maxWidth < 720;
+          final textStyle = TextStyle(
+            color: _ink,
+            fontFamily: 'monospace',
+            fontSize: compact ? 12 : 13,
+            height: 1.4,
+          );
+
+          Widget buildFastaCard() {
+            return DecoratedBox(
               decoration: _panelDecoration(),
               child: Padding(
-                padding: const EdgeInsets.all(16),
+                padding: EdgeInsets.all(compact ? 12 : 16),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -821,7 +965,7 @@ class _ResultPanel extends StatelessWidget {
                           ? 'Synthetic coding DNA from reverse translation'
                           : 'Синтетическая coding DNA, полученная обратным переводом белка',
                     ),
-                    const SizedBox(height: 10),
+                    SizedBox(height: compact ? 8 : 10),
                     Expanded(
                       child: DecoratedBox(
                         decoration: BoxDecoration(
@@ -829,21 +973,19 @@ class _ResultPanel extends StatelessWidget {
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: _line),
                         ),
-                        child: SizedBox.expand(
+                        child: Padding(
+                          padding: EdgeInsets.all(compact ? 10 : 12),
                           child: SingleChildScrollView(
-                            padding: const EdgeInsets.all(12),
+                            physics: const BouncingScrollPhysics(
+                              parent: AlwaysScrollableScrollPhysics(),
+                            ),
                             child: SelectableText(
                               hasResult
                                   ? fastaText
                                   : english
-                                      ? 'FASTA will appear here after calculation. PDB stores protein structure, not source DNA.'
-                                      : 'После расчета здесь появится FASTA. PDB хранит структуру белка, а не исходную ДНК.',
-                              style: const TextStyle(
-                                color: _ink,
-                                fontFamily: 'monospace',
-                                fontSize: 13,
-                                height: 1.45,
-                              ),
+                                  ? 'FASTA will appear here after calculation. PDB stores protein structure, not source DNA.'
+                                  : 'После расчета здесь появится FASTA. PDB хранит структуру белка, а не исходную ДНК.',
+                              style: textStyle,
                             ),
                           ),
                         ),
@@ -852,24 +994,25 @@ class _ResultPanel extends StatelessWidget {
                   ],
                 ),
               ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          SizedBox(
-            width: 300,
-            child: DecoratedBox(
+            );
+          }
+
+          Widget buildMutationsCard() {
+            return DecoratedBox(
               decoration: _panelDecoration(),
               child: Padding(
-                padding: const EdgeInsets.all(16),
+                padding: EdgeInsets.all(compact ? 12 : 16),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     _PanelTitle(
                       icon: Icons.account_tree_outlined,
                       title: english ? 'Mutations' : 'Мутации',
-                      subtitle: english ? 'Positions are highlighted in 3D' : 'Позиции подсвечены в 3D',
+                      subtitle: english
+                          ? 'Positions are highlighted in 3D'
+                          : 'Позиции подсвечены в 3D',
                     ),
-                    const SizedBox(height: 10),
+                    SizedBox(height: compact ? 8 : 10),
                     Expanded(
                       child: _MutationList(
                         english: english,
@@ -879,28 +1022,50 @@ class _ResultPanel extends StatelessWidget {
                     const SizedBox(height: 10),
                     SizedBox(
                       width: double.infinity,
+                      height: compact ? 34 : null,
                       child: FilledButton.icon(
                         onPressed: hasResult ? onDownload : null,
-                        icon: const Icon(Icons.download_outlined),
-                        label: Text(english ? 'Download FASTA' : 'Скачать FASTA'),
+                        icon: const Icon(Icons.download_outlined, size: 18),
+                        label: Text(
+                          english ? 'Download FASTA' : 'Скачать FASTA',
+                          style: TextStyle(fontSize: compact ? 12 : null),
+                        ),
                       ),
                     ),
                   ],
                 ),
               ),
-            ),
-          ),
-        ],
+            );
+          }
+
+          if (narrow) {
+            return Column(
+              children: [
+                Expanded(child: buildFastaCard()),
+                const SizedBox(height: 12),
+                Expanded(child: buildMutationsCard()),
+              ],
+            );
+          }
+
+          return Row(
+            children: [
+              Expanded(child: buildFastaCard()),
+              const SizedBox(width: 12),
+              ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: compact ? 260 : 300),
+                child: buildMutationsCard(),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
 class _MutationList extends StatelessWidget {
-  const _MutationList({
-    required this.english,
-    required this.mutations,
-  });
+  const _MutationList({required this.english, required this.mutations});
 
   final bool english;
   final List<_MutationInfo> mutations;
@@ -917,6 +1082,9 @@ class _MutationList extends StatelessWidget {
     }
 
     return ListView.separated(
+      physics: const BouncingScrollPhysics(
+        parent: AlwaysScrollableScrollPhysics(),
+      ),
       itemCount: mutations.length,
       separatorBuilder: (_, __) => const Divider(height: 1),
       itemBuilder: (context, index) {
@@ -929,12 +1097,15 @@ class _MutationList extends StatelessWidget {
                 width: 54,
                 child: Text(
                   mutation.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     color: _ink,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
               ),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text(
                   mutation.reason,
@@ -991,10 +1162,16 @@ String _statusText(String status, bool english) {
   };
 }
 
-_OptimizationResult _simulateOptimization(String pdb, double temperature, double ph) {
+_OptimizationResult _simulateOptimization(
+  String pdb,
+  double temperature,
+  double ph,
+) {
   final residues = _extractResidues(pdb);
   final mutations = <_MutationInfo>[];
-  final sequence = residues.map((residue) => _threeToOne[residue.name] ?? 'X').toList();
+  final sequence = residues
+      .map((residue) => _threeToOne[residue.name] ?? 'X')
+      .toList();
 
   for (final residue in residues) {
     if (mutations.length >= 6) break;
